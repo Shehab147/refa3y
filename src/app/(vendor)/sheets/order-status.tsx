@@ -1,0 +1,2 @@
+import { SelectSheet } from '@/components/select-sheet'; import { useAppStore } from '@/components/app-store';
+export default function OrderStatus(){const {vendorOrderStatus,setVendorOrderStatus}=useAppStore();const options=['Confirmed','Preparing','Ready for pickup','Out for delivery'];return <SelectSheet title="Update order status" subtitle="The customer will see the new status" options={options} initial={Math.max(0,options.indexOf(vendorOrderStatus))} button="Save status" onConfirm={setVendorOrderStatus}/>}

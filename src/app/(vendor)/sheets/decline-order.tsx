@@ -1,0 +1,2 @@
+import { SelectSheet } from '@/components/select-sheet'; import { useAppStore } from '@/components/app-store';
+export default function Decline(){const {declineVendorOrder}=useAppStore();return <SelectSheet title="Decline this order?" subtitle="The buyer will receive a full refund and your selected explanation." options={['Not enough stock','Unable to meet delivery time','Product quality issue','Another reason']} button="Decline order" destructive onConfirm={declineVendorOrder}/>}
