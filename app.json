@@ -12,6 +12,7 @@
       "bundleIdentifier": "com.0x054m4.refa3y"
     },
     "android": {
+      "package": "com.0x054m4.refa3y",
       "adaptiveIcon": {
         "backgroundColor": "#123C2E",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
