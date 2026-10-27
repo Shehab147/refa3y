@@ -8,13 +8,13 @@ import { MarketMap } from '@/components/market-map';
 const categories = ['All produce', 'Vegetables', 'Fruit', 'Herbs', 'Dairy', 'Pantry'];
 export default function Market() {
   const params=useLocalSearchParams<{category?:string;query?:string}>();
-  const [category, setCategory] = useState(params.category??'All produce');
+  const category = categories.find((item) => item === params.category) ?? 'All produce';
   const [query, setQuery] = useState(params.query??'');
   const {marketDistance,marketMethods,savedProducts,toggleSavedProduct}=useAppStore();
   const visible = useMemo(() => products.filter((item) => item.name.toLowerCase().includes(query.toLowerCase()) && (category==='All produce'||item.category===category) && (marketDistance==='Any distance'||item.distance<=(marketDistance==='Under 10 km'?10:25)) && (!marketMethods.length||marketMethods.includes(item.method))), [query,category,marketDistance,marketMethods]);
   return <Screen eyebrow="Grown with care" title="The market" action={<RoundButton label="Basket" icon="cart" dark onPress={() => router.push('/(buyer)/sheets/cart')} />}>
     <Search value={query} onChangeText={setQuery} onFilter={() => router.push('/(buyer)/sheets/filter')} />
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} className="mb-5">{categories.map((item) => <Pressable key={item} onPress={() => setCategory(item)} className={`mr-2 rounded-full px-4 py-2 ${category === item ? 'bg-forest' : 'border border-line bg-white'}`}><Text className={`font-sans text-xs font-bold ${category === item ? 'text-white' : 'text-muted'}`}>{item}</Text></Pressable>)}</ScrollView>
+    <ScrollView horizontal showsHorizontalScrollIndicator={false} className="mb-5">{categories.map((item) => <Pressable key={item} onPress={() => router.setParams({ category: item })} className={`mr-2 rounded-full px-4 py-2 ${category === item ? 'bg-forest' : 'border border-line bg-white'}`}><Text className={`font-sans text-xs font-bold ${category === item ? 'text-white' : 'text-muted'}`}>{item}</Text></Pressable>)}</ScrollView>
     <View className="mb-6">
       <View className="mb-3 flex-row items-end justify-between">
         <View>
