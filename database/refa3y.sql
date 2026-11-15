@@ -480,3 +480,17 @@ INSERT INTO `categories` (`name`, `slug`, `icon_name`, `sort_order`) VALUES
   ('Dairy', 'dairy', 'drop.fill', 4),
   ('Pantry', 'pantry', 'shippingbox.fill', 5)
 ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `icon_name` = VALUES(`icon_name`), `sort_order` = VALUES(`sort_order`);
+
+-- Development login account. Change or remove this account before production.
+-- Email: test.buyer@refa3y.cc
+-- Phone: +201001234567
+-- Password: Refa3yTest!2026
+INSERT INTO `users` (`full_name`, `email`, `phone`, `password_hash`, `role`, `is_phone_verified`, `is_email_verified`, `status`) VALUES
+  ('Refa3y Test Buyer', 'test.buyer@refa3y.cc', '+201001234567', '$2y$10$cPFbANRqeyXfrBRtPSTNGe4UvKjSMnIO.X6SXqoFQGr5PPxPcXSJq', 'buyer', 1, 1, 'active')
+ON DUPLICATE KEY UPDATE
+  `full_name` = VALUES(`full_name`),
+  `password_hash` = VALUES(`password_hash`),
+  `role` = VALUES(`role`),
+  `is_phone_verified` = VALUES(`is_phone_verified`),
+  `is_email_verified` = VALUES(`is_email_verified`),
+  `status` = VALUES(`status`);
