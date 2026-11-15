@@ -3,19 +3,20 @@ import { router, useLocalSearchParams } from 'expo-router';
 import { useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
 import { DetailShell } from '@/components/detail-ui';
-import { Icon, PrimaryButton, StatusPill, palette, products } from '@/components/market-ui';
+import { Icon, PrimaryButton, StatusPill, palette } from '@/components/market-ui';
 import { useAppStore } from '@/components/app-store';
 
 export default function Product() {
   const { name } = useLocalSearchParams<{ name?: string }>();
-  const product = products.find((item) => item.name === name) ?? products[0];
+  const { addCartItem, savedProducts, toggleSavedProduct, marketProducts } = useAppStore();
+  const product = marketProducts.find((item) => item.name === name) ?? marketProducts[0];
   const [quantity, setQuantity] = useState(1);
-  const { addCartItem, savedProducts, toggleSavedProduct } = useAppStore();
+  if (!product) return <DetailShell title="Product details"><Text className="font-sans text-sm text-muted">This product is unavailable.</Text></DetailShell>;
   const saved=savedProducts.includes(product.name);
   const unitPrice = Number(product.price.match(/\d+/)?.[0] ?? 18);
   const unit = product.price.split('/')[1]?.trim() ?? 'item';
-  return <DetailShell title="Product details" action={<Pressable accessibilityLabel={saved?'Remove from saved':'Save product'} onPress={() => toggleSavedProduct(product.name)}><Icon name={saved ? 'heart.fill' : 'heart'} color={palette.forest} /></Pressable>} footer={<PrimaryButton onPress={() => { addCartItem(product.name,unit,unitPrice,quantity); router.push('/(buyer)/sheets/cart'); }}>Add to basket · EGP {unitPrice * quantity}</PrimaryButton>}>
-    <Image source={product.image} contentFit="cover" style={{ width: '100%', height: 300, borderRadius: 28 }} />
+  return <DetailShell title="Product details" action={<Pressable accessibilityLabel={saved?'Remove from saved':'Save product'} onPress={() => void toggleSavedProduct(product.name)}><Icon name={saved ? 'heart.fill' : 'heart'} color={palette.forest} /></Pressable>} footer={<PrimaryButton onPress={() => { void addCartItem(product.name,unit,unitPrice,quantity); router.push('/(buyer)/sheets/cart'); }}>Add to basket · EGP {unitPrice * quantity}</PrimaryButton>}>
+    {product.image?<Image source={product.image} contentFit="cover" style={{ width: '100%', height: 300, borderRadius: 28 }} />:<View className="h-[300px] items-center justify-center rounded-[28px] bg-mint"><Icon name="leaf.fill" size={48} color={palette.leaf}/></View>}
     <View className="mt-5 flex-row items-center justify-between gap-3"><StatusPill large>{product.tag}</StatusPill><View className="rounded-full bg-mint px-5 py-3"><Text className="font-sans text-sm font-bold text-forest">4.9 ★</Text></View></View><Text className="mt-3 font-sans text-[28px] font-bold text-ink">{product.name}</Text><Text className="mt-1 font-sans text-base font-bold text-forest">{product.price}</Text>
     <Text className="mt-5 font-sans text-sm leading-6 text-muted">Fresh, carefully selected produce grown without synthetic pesticides. Picked recently and packed at the farm.</Text>
     <View className="my-6 h-px bg-line"/><View className="flex-row items-center"><View className="h-12 w-12 items-center justify-center rounded-full bg-mint"><Icon name="leaf.fill" color={palette.forest}/></View><View className="ml-3 flex-1"><Text className="font-sans text-base font-bold text-ink">{product.farm}</Text><Text className="mt-1 font-sans text-xs text-muted">Verified grower · Giza, 18 km away</Text></View></View>
