@@ -1,29 +1,45 @@
 import { router } from 'expo-router';
+import { useRef, useState } from 'react';
 import { Text, View } from 'react-native';
 import { useAppStore } from '@/components/app-store';
 import { DetailShell } from '@/components/detail-ui';
 import { Icon, ListRow, PrimaryButton } from '@/components/market-ui';
+import { ApiError } from '@/lib/api';
 
 export default function Checkout() {
-  const { cart, addresses, payments, deliveryWindow, placeOrder } = useAppStore();
+  const { cart, addresses, payments, placeOrder } = useAppStore();
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const submittingRef = useRef(false);
   const subtotal = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
   const total = cart.length ? subtotal + 43 : 0;
   const address = addresses.find((item) => item.isDefault);
   const payment = payments.find((item) => item.isDefault);
-  const fees: ReadonlyArray<readonly [string, number]> = cart.length
+  const fees: readonly (readonly [string, number])[] = cart.length
     ? [['Subtotal', subtotal], ['Delivery', 35], ['Service fee', 8]]
     : [['Subtotal', 0]];
 
   return <DetailShell
     title="Checkout"
     footer={<PrimaryButton
-      disabled={!cart.length || !address || !payment}
-      onPress={() => { placeOrder(); router.replace('/(buyer)/sheets/order-success'); }}
-    >Place order · EGP {total}</PrimaryButton>}
+      disabled={!cart.length || !address || !payment || submitting}
+      onPress={() => {
+        if (submittingRef.current) return;
+        submittingRef.current = true;
+        setSubmitting(true);
+        setError(null);
+        void placeOrder().then((orderNumber) => {
+          router.replace({ pathname: '/(buyer)/sheets/order-success', params: { orderNumber } });
+        }).catch((caught: unknown) => {
+          const message = caught instanceof ApiError ? caught.message : 'Unable to place the order.';
+          setError(`${message} Check your orders before trying again.`);
+        }).finally(() => { submittingRef.current = false; setSubmitting(false); });
+      }}
+    >{submitting ? 'Placing order…' : `Place order · EGP ${total}`}</PrimaryButton>}
   >
+    {error ? <Text className="mb-4 font-sans text-sm text-[#A3483A]">{error}</Text> : null}
     <View className="rounded-3xl border border-line bg-white px-4">
       <ListRow onPress={() => router.push('/(buyer)/addresses')} icon="mappin.and.ellipse" title={address ? `Deliver to ${address.label.toLowerCase()}` : 'Choose an address'} subtitle={address?.details} />
-      <ListRow onPress={() => router.push('/(buyer)/sheets/delivery')} icon="clock" title="Delivery window" subtitle={deliveryWindow} />
     </View>
     <Text className="mb-3 mt-7 font-sans text-xl font-bold text-ink">Your basket</Text>
     <View className="rounded-3xl border border-line bg-white p-5">

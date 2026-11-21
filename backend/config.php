@@ -10,10 +10,28 @@ mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 const API_MAX_PAGE_SIZE = 100;
 const API_DEFAULT_PAGE_SIZE = 20;
 
+/** Values from an optional, untracked backend/.env file (KEY=value per line); real environment variables win. */
+function env_file_values(): array
+{
+    static $values = null;
+    if ($values !== null) return $values;
+    $values = [];
+    $path = __DIR__ . '/.env';
+    if (!is_readable($path)) return $values;
+    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+        $line = trim($line);
+        if ($line === '' || $line[0] === '#' || !str_contains($line, '=')) continue;
+        [$key, $value] = explode('=', $line, 2);
+        $values[trim($key)] = trim($value, " \t\"'");
+    }
+    return $values;
+}
+
 function env_value(string $name, ?string $default = null): ?string
 {
     $value = getenv($name);
-    return $value === false || $value === '' ? $default : $value;
+    if ($value === false || $value === '') $value = env_file_values()[$name] ?? '';
+    return $value === '' ? $default : $value;
 }
 
 function configure_api_headers(): void
@@ -39,13 +57,61 @@ function configure_api_headers(): void
     }
 }
 
+function api_request_id(): string
+{
+    static $id = null;
+    return $id ??= bin2hex(random_bytes(4));
+}
+
+/** Appends a line to backend/logs/api.log (or the PHP error log if the file is not writable). Never log secrets. */
+function api_log(string $level, string $message, array $context = []): void
+{
+    $line = sprintf(
+        '[%s] [%s] [%s] %s %s %s%s',
+        date('Y-m-d H:i:s'),
+        strtoupper($level),
+        api_request_id(),
+        request_method(),
+        $_SERVER['REQUEST_URI'] ?? '',
+        $message,
+        $context === [] ? '' : ' ' . json_encode($context, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PARTIAL_OUTPUT_ON_ERROR)
+    );
+    $dir = __DIR__ . '/logs';
+    if ((is_dir($dir) || @mkdir($dir, 0775, true)) && @file_put_contents($dir . '/api.log', $line . PHP_EOL, FILE_APPEND | LOCK_EX) !== false) return;
+    error_log($line);
+}
+
+function api_log_exception(string $label, Throwable $exception): void
+{
+    api_log('error', $label . ': ' . get_class($exception) . ': ' . $exception->getMessage(), [
+        'at' => basename($exception->getFile()) . ':' . $exception->getLine(),
+        'trace' => array_slice(explode("\n", $exception->getTraceAsString()), 0, 8),
+    ]);
+}
+
+function api_debug_enabled(): bool { return env_value('API_DEBUG') === '1'; }
+
+function api_discard_output(): void
+{
+    while (ob_get_level() > 0) {
+        $stray = (string) ob_get_clean();
+        if (trim($stray) !== '') api_log('warning', 'Discarded unexpected output before JSON response.', ['output' => mb_substr($stray, 0, 500)]);
+    }
+}
+
+/** Always emits a clean JSON envelope; stray PHP output (warnings, notices, BOMs) is logged and dropped. */
 function respond(int $status, string $message, mixed $data = null, array $extra = []): void
 {
+    $GLOBALS['api_responded'] = true;
+    api_discard_output();
     if (!headers_sent()) {
         http_response_code($status);
         header('Content-Type: application/json; charset=utf-8');
+        header('X-Request-Id: ' . api_request_id());
     }
-    echo json_encode(array_merge(['status' => $status, 'message' => $message, 'data' => $data], $extra), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    if ($status >= 400) api_log($status >= 500 ? 'error' : 'warn', "Responded {$status}: {$message}", $extra['errors'] ?? []);
+    $json = json_encode(array_merge(['status' => $status, 'message' => $message, 'data' => $data, 'request_id' => api_request_id()], $extra), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+    echo $json !== false ? $json : '{"status":500,"message":"Failed to encode the response.","data":null}';
     exit;
 }
 
@@ -53,6 +119,30 @@ function fail(int $status, string $message, array $errors = []): void
 {
     respond($status, $message, null, $errors === [] ? [] : ['errors' => $errors]);
 }
+
+/** Converts every PHP failure into a logged JSON response instead of HTML/plain text. */
+function bootstrap_error_handling(): void
+{
+    ini_set('display_errors', '0');
+    ini_set('log_errors', '1');
+    ob_start();
+
+    set_error_handler(static function (int $severity, string $message, string $file, int $line): bool {
+        if (!(error_reporting() & $severity)) return false;
+        api_log('warn', "PHP {$message}", ['at' => basename($file) . ':' . $line]);
+        return true;
+    });
+
+    register_shutdown_function(static function (): void {
+        if (!empty($GLOBALS['api_responded'])) return;
+        $error = error_get_last();
+        if ($error === null || !in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR, E_RECOVERABLE_ERROR], true)) return;
+        api_log('error', 'Fatal PHP error: ' . $error['message'], ['at' => basename($error['file']) . ':' . $error['line']]);
+        respond(500, 'An unexpected server error occurred.', null, api_debug_enabled() ? ['debug' => $error['message']] : []);
+    });
+}
+
+bootstrap_error_handling();
 
 function request_method(): string
 {

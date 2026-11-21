@@ -1,2 +1,24 @@
-import { router } from 'expo-router'; import { Text, View } from 'react-native'; import { DetailShell } from '@/components/detail-ui'; import { PrimaryButton, StatusPill } from '@/components/market-ui'; import { useAppStore } from '@/components/app-store';
-export default function Appeals(){const {appealResponse}=useAppStore();return <DetailShell title="Returns and appeals" footer={appealResponse?undefined:<PrimaryButton onPress={()=>router.push('/(vendor)/sheets/appeal-response')}>Review and respond</PrimaryButton>}><View className={`rounded-3xl border p-5 ${appealResponse?'border-line bg-white':'border-[#E8C77E] bg-[#FFF8E8]'}`}><View className="flex-row justify-between"><Text className="font-sans text-xs font-bold text-muted">Appeal #AP-82</Text><StatusPill tone={appealResponse?'green':'gold'}>{appealResponse?'Response submitted':'Response needed'}</StatusPill></View><Text className="mt-3 font-sans text-lg font-bold text-ink">Quality issue · order #RF-2878</Text><Text className="mt-2 font-sans text-sm leading-6 text-muted">The buyer reported bruising on 2 kg of tomatoes.</Text>{appealResponse?<View className="mt-4 rounded-2xl bg-mint p-4"><Text className="font-sans text-xs font-bold text-forest">YOUR RESPONSE</Text><Text className="mt-2 font-sans text-sm leading-5 text-ink">{appealResponse}</Text></View>:null}</View><Text className="mb-3 mt-7 font-sans text-xl font-bold text-ink">Resolved cases</Text><View className="rounded-3xl border border-line bg-white p-5"><StatusPill tone="gray">Resolved</StatusPill><Text className="mt-3 font-sans text-base font-bold text-ink">Missing item · order #RF-2740</Text><Text className="mt-2 font-sans text-sm text-muted">Partial refund issued · 8 October</Text></View></DetailShell>}
+import { router } from 'expo-router';
+import { useCallback } from 'react';
+import { Pressable, Text, View } from 'react-native';
+import { DetailShell } from '@/components/detail-ui';
+import { PrimaryButton, StatusPill } from '@/components/market-ui';
+import { useFocusApi } from '@/hooks/use-focus-api';
+import { api } from '@/lib/api';
+import { orderStatusLabel } from '@/lib/orders';
+
+type Appeal = { id: number; appeal_number: string; order_id: number; status: string; reason_type: string; description: string; vendor_response: string | null; resolution_note: string | null };
+
+export default function Appeals() {
+  const load = useCallback(() => api<Appeal[]>('appeals/list'), []);
+  const { data: appeals, loading, error, refresh } = useFocusApi(load);
+  return <DetailShell title="Returns and appeals">
+    {loading ? <Text className="font-sans text-sm text-muted">Loading appeals…</Text> : error ? <Pressable onPress={refresh}><Text className="font-sans text-sm text-[#A3483A]">{error} Tap to retry.</Text></Pressable> : !appeals?.length ? <Text className="font-sans text-sm text-muted">No appeals found.</Text> : appeals.map((appeal) => <View key={appeal.id} className="mb-4 rounded-3xl border border-line bg-white p-5">
+      <View className="flex-row justify-between"><Text className="font-sans text-xs font-bold text-muted">{appeal.appeal_number}</Text><StatusPill tone={appeal.status === 'response_needed' ? 'gold' : 'green'}>{orderStatusLabel(appeal.status)}</StatusPill></View>
+      <Text className="mt-3 font-sans text-lg font-bold text-ink">{orderStatusLabel(appeal.reason_type)}</Text><Text className="mt-2 font-sans text-sm text-muted">{appeal.description}</Text>
+      {appeal.vendor_response ? <Text className="mt-4 font-sans text-sm text-ink">Your response: {appeal.vendor_response}</Text> : null}
+      {appeal.resolution_note ? <Text className="mt-4 font-sans text-sm text-muted">Resolution: {appeal.resolution_note}</Text> : null}
+      {appeal.status === 'response_needed' ? <View className="mt-4"><PrimaryButton onPress={() => router.push({ pathname: '/(vendor)/sheets/appeal-response', params: { id: String(appeal.id), number: appeal.appeal_number } })}>Respond</PrimaryButton></View> : null}
+    </View>)}
+  </DetailShell>;
+}

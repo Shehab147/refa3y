@@ -1,2 +1,23 @@
-import { Text, View } from 'react-native'; import { DetailShell } from '@/components/detail-ui'; import { ListRow } from '@/components/market-ui';
-export default function Analytics(){const bars=[44,70,55,96,74,120,88];return <DetailShell title="Analytics"><View className="rounded-3xl bg-forest p-5"><Text className="font-sans text-sm text-[#BFD4C6]">Revenue this month</Text><Text className="mt-2 font-sans text-[32px] font-bold text-white">EGP 24,680</Text><Text className="mt-3 font-sans text-xs font-bold text-[#DFECE4]">Up 12.4% from last month</Text></View><View className="mt-4 rounded-3xl border border-line bg-white p-5"><Text className="font-sans text-base font-bold text-ink">Revenue by day</Text><View className="mt-6 h-40 flex-row items-end justify-between">{bars.map((h,i)=><View key={i} className="items-center"><View className={`w-6 rounded-t-lg ${i===5?'bg-forest':'bg-[#B9D0C1]'}`} style={{height:h}}/><Text className="mt-2 font-sans text-[10px] text-muted">{['M','T','W','T','F','S','S'][i]}</Text></View>)}</View></View><View className="mt-4 flex-row gap-3"><View className="flex-1 rounded-3xl border border-line bg-white p-4"><Text className="font-sans text-xs text-muted">Average order</Text><Text className="mt-2 font-sans text-xl font-bold text-ink">EGP 312</Text></View><View className="flex-1 rounded-3xl border border-line bg-white p-4"><Text className="font-sans text-xs text-muted">Repeat buyers</Text><Text className="mt-2 font-sans text-xl font-bold text-ink">41%</Text></View></View><Text className="mb-3 mt-7 font-sans text-xl font-bold text-ink">Top products</Text><View className="rounded-3xl border border-line bg-white px-4"><ListRow icon="chart.bar.fill" title="Baladi Tomatoes" subtitle="EGP 8,460 · 124 orders"/><ListRow icon="chart.bar.fill" title="Sweet Oranges" subtitle="EGP 5,280 · 68 orders"/></View></DetailShell>}
+import { useCallback } from 'react';
+import { Pressable, Text, View } from 'react-native';
+import { DetailShell } from '@/components/detail-ui';
+import { ListRow } from '@/components/market-ui';
+import { useFocusApi } from '@/hooks/use-focus-api';
+import { api } from '@/lib/api';
+import { type Order, orderStatusLabel } from '@/lib/orders';
+
+export default function Analytics() {
+  const load = useCallback(() => api<Order[]>('orders/list'), []);
+  const { data: orders, loading, error, refresh } = useFocusApi(load);
+  const counts = (orders ?? []).reduce<Record<string, number>>((result, order) => {
+    result[order.status] = (result[order.status] ?? 0) + 1;
+    return result;
+  }, {});
+  return <DetailShell title="Order overview">
+    {loading ? <Text className="font-sans text-sm text-muted">Loading orders…</Text> : error ? <Pressable onPress={refresh}><Text className="font-sans text-sm text-[#A3483A]">{error} Tap to retry.</Text></Pressable> : <>
+      <View className="rounded-3xl bg-forest p-5"><Text className="font-sans text-sm text-white">Total orders</Text><Text className="mt-2 font-sans text-[32px] font-bold text-white">{orders?.length ?? 0}</Text></View>
+      <Text className="mb-3 mt-7 font-sans text-xl font-bold text-ink">Orders by status</Text>
+      <View className="rounded-3xl border border-line bg-white px-4">{Object.entries(counts).map(([status, count]) => <ListRow key={status} icon="shippingbox.fill" title={orderStatusLabel(status)} subtitle={`${count} ${count === 1 ? 'order' : 'orders'}`} />)}{!Object.keys(counts).length ? <Text className="py-4 font-sans text-sm text-muted">No orders found.</Text> : null}</View>
+    </>}
+  </DetailShell>;
+}

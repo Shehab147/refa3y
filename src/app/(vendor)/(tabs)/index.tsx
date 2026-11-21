@@ -1,2 +1,30 @@
-import { router } from 'expo-router'; import { Pressable, Text, View } from 'react-native'; import { Icon, ListRow, RoundButton, Screen, SectionTitle, StatusPill, palette } from '@/components/market-ui';
-export default function Dashboard(){return <Screen eyebrow="Vendor dashboard" title="Nile Valley Farms" action={<RoundButton label="Inbox" icon="bell" onPress={()=>router.push('/(vendor)/(tabs)/inbox')}/> }><Pressable onPress={()=>router.push('/(vendor)/analytics')} className="rounded-[28px] bg-forest p-5"><Text className="font-sans text-sm text-[#BFD4C6]">Revenue this month</Text><Text className="mt-2 font-sans text-[32px] font-bold text-white">EGP 24,680</Text><Text className="mt-4 font-sans text-xs font-bold text-[#E2EFE6]">Up 12.4% from September</Text></Pressable><View className="mt-4 flex-row gap-3"><Pressable onPress={()=>router.push('/(vendor)/(tabs)/orders')} className="flex-1 rounded-3xl border border-line bg-white p-4"><Icon name="shippingbox.fill" color={palette.leaf}/><Text className="mt-4 font-sans text-2xl font-bold text-ink">38</Text><Text className="mt-1 font-sans text-xs text-muted">Orders</Text></Pressable><Pressable onPress={()=>router.push('/(vendor)/appeals')} className="flex-1 rounded-3xl border border-line bg-white p-4"><Icon name="arrow.uturn.left.circle.fill" color={palette.gold}/><Text className="mt-4 font-sans text-2xl font-bold text-ink">2.1%</Text><Text className="mt-1 font-sans text-xs text-muted">Return rate</Text></Pressable></View><SectionTitle title="Needs attention"/><View className="rounded-3xl border border-line bg-white px-4"><ListRow onPress={()=>router.push('/(vendor)/(tabs)/orders')} icon="clock.badge.exclamationmark" title="3 orders to confirm" subtitle="Oldest received 42 minutes ago" trailing={<StatusPill tone="gold">Review</StatusPill>}/><ListRow onPress={()=>router.push('/(vendor)/appeals')} icon="exclamationmark.bubble" title="1 open appeal" subtitle="Response due tomorrow"/></View><SectionTitle title="Recent orders" link="See all" onPress={()=>router.push('/(vendor)/(tabs)/orders')}/><View className="rounded-3xl border border-line bg-white px-4"><ListRow onPress={()=>router.push('/(vendor)/order-detail')} icon="person.crop.circle" title="Order #RF-2925 · Sarah A." subtitle="5 items · EGP 418" trailing={<StatusPill tone="gold">New</StatusPill>}/><ListRow onPress={()=>router.push('/(vendor)/order-detail')} icon="person.crop.circle" title="Order #RF-2922 · Omar K." subtitle="2 items · EGP 156" trailing={<StatusPill>Preparing</StatusPill>}/></View></Screen>}
+import { router } from 'expo-router';
+import { useCallback } from 'react';
+import { Pressable, Text, View } from 'react-native';
+import { useAppStore } from '@/components/app-store';
+import { ListRow, RoundButton, Screen, SectionTitle, StatusPill } from '@/components/market-ui';
+import { useFocusApi } from '@/hooks/use-focus-api';
+import { api } from '@/lib/api';
+import { type Order, orderStatusLabel } from '@/lib/orders';
+
+type Appeal = { id: number; status: string };
+
+export default function Dashboard() {
+  const { farmProfile } = useAppStore();
+  const load = useCallback(async () => {
+    const [orders, appeals] = await Promise.all([api<Order[]>('orders/list'), api<Appeal[]>('appeals/list')]);
+    return { orders, appeals };
+  }, []);
+  const { data, loading, error, refresh } = useFocusApi(load);
+  return <Screen eyebrow="Vendor dashboard" title={farmProfile.farm || 'Your farm'} action={<RoundButton label="Inbox" icon="bell" onPress={() => router.push('/(vendor)/(tabs)/inbox')} />}>
+    {loading ? <Text className="font-sans text-sm text-muted">Loading dashboard…</Text> : error ? <Pressable onPress={refresh}><Text className="font-sans text-sm text-[#A3483A]">{error} Tap to retry.</Text></Pressable> : data ? <>
+      <View className="rounded-3xl border border-line bg-white px-4">
+        <ListRow onPress={() => router.push('/(vendor)/(tabs)/orders')} icon="shippingbox.fill" title={`${data.orders.filter((order) => order.status === 'new').length} new orders`} />
+        <ListRow onPress={() => router.push('/(vendor)/appeals')} icon="exclamationmark.bubble" title={`${data.appeals.filter((appeal) => appeal.status === 'response_needed').length} appeals need a response`} />
+        <ListRow onPress={() => router.push('/(vendor)/analytics')} icon="chart.bar.fill" title="Order overview" />
+      </View>
+      <SectionTitle title="Recent orders" link="See all" onPress={() => router.push('/(vendor)/(tabs)/orders')} />
+      {!data.orders.length ? <Text className="font-sans text-sm text-muted">No orders yet.</Text> : <View className="rounded-3xl border border-line bg-white px-4">{data.orders.slice(0, 5).map((order) => <ListRow key={order.id} onPress={() => router.push({ pathname: '/(vendor)/order-detail', params: { id: String(order.id) } })} icon="person.crop.circle" title={order.order_number} subtitle={`${order.buyer_name_snapshot} · ${order.currency} ${order.total_amount}`} trailing={<StatusPill>{orderStatusLabel(order.status)}</StatusPill>} />)}</View>}
+    </> : null}
+  </Screen>;
+}

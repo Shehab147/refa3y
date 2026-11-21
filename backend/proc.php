@@ -76,13 +76,32 @@ function issue_token(array $user): string
     return $body . '.' . b64url_encode(hash_hmac('sha256', $body, token_secret(), true));
 }
 
+function authorization_header(): string
+{
+    foreach ([$_SERVER['HTTP_AUTHORIZATION'] ?? null, $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? null, getenv('HTTP_AUTHORIZATION'), getenv('REDIRECT_HTTP_AUTHORIZATION')] as $value) {
+        if (is_string($value) && trim($value) !== '') return trim($value);
+    }
+    if (function_exists('getallheaders')) {
+        $headers = getallheaders();
+        if (is_array($headers)) {
+            foreach ($headers as $name => $value) {
+                if (strcasecmp($name, 'Authorization') === 0 && is_string($value)) return trim($value);
+            }
+        }
+    }
+    return '';
+}
+
 /** @return array<string, mixed> */
 function authenticated_user(): array
 {
     static $user = null;
     if ($user !== null) return $user;
-    $header = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
-    if (!preg_match('/^Bearer\s+([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/', $header, $matches)) fail(401, 'Authentication is required.');
+    $header = authorization_header();
+    if (!preg_match('/^Bearer\s+([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/i', $header, $matches)) {
+        api_log('warning', 'Authentication header missing or malformed.', ['header_present' => $header !== '']);
+        fail(401, 'Authentication is required.', ['authorization' => 'missing_or_malformed']);
+    }
     [$body, $signature] = explode('.', $matches[1], 2);
     $expected = b64url_encode(hash_hmac('sha256', $body, token_secret(), true));
     $decoded = b64url_decode($body);
@@ -215,8 +234,8 @@ function auth_reset_password(): never
 {
     require_method('POST');
     $phone = normalize_phone(required_string('phone', 30));
-    if (consume_verification_code($phone, 'password_reset', required_string('code', 6)) === null) fail(422, 'The verification code is invalid or expired.');
     $password = require_password('new_password');
+    if (consume_verification_code($phone, 'password_reset', required_string('code', 6)) === null) fail(422, 'The verification code is invalid or expired.');
     db_statement('UPDATE users SET password_hash = ? WHERE phone = ?', 'ss', [password_hash($password, PASSWORD_DEFAULT), $phone]);
     respond(200, 'Password updated.');
 }
@@ -248,6 +267,14 @@ function catalog_product(): never
 }
 
 function catalog_categories(): never { require_method('GET'); respond(200, 'Categories retrieved.', db_all('SELECT id, name, slug, icon_name, sort_order FROM categories WHERE is_active = 1 ORDER BY sort_order, name')); }
+
+function catalog_farms(): never
+{
+    require_method('GET');
+    $page = pagination();
+    $farms = db_all('SELECT id, name FROM farms WHERE is_active=1 AND verification_status=\'verified\' ORDER BY name,id LIMIT ? OFFSET ?', 'ii', [$page['per_page'], $page['offset']]);
+    respond(200, 'Farms retrieved.', ['items' => $farms, 'pagination' => $page]);
+}
 
 function saved_list(): never
 {
@@ -281,6 +308,7 @@ function payments_list(): never { require_method('GET'); $u=require_user(['buyer
 function payment_create(): never
 {
     require_method('POST'); $u=require_user(['buyer']); $type=required_enum('method_type',['cash_on_delivery','card']);
+    if ($type !== 'cash_on_delivery') fail(422, 'Card payments are not currently supported.');
     if ($type === 'cash_on_delivery') { $label='Cash on delivery'; $provider='manual'; $providerId=null; $brand=null; $lastFour=null; $month=null; $year=null; }
     else { if (input('card_number') !== null) fail(422,'Raw card numbers must not be sent to this API. Tokenize the card with a payment provider first.'); $provider=clean_text('provider',80); $providerId=clean_text('provider_payment_method_id',191); $brand=clean_text('card_brand',40,false); $lastFour=required_string('card_last_four',4); if(!preg_match('/^\d{4}$/',$lastFour)) fail(422,'card_last_four must contain four digits.'); $month=required_int('card_expiry_month',1); $year=required_int('card_expiry_year',date('Y')); if($month>12) fail(422,'card_expiry_month is invalid.'); $label=clean_text('display_label',180); }
     $hasDefault=!db_exists('SELECT 1 FROM payment_methods WHERE user_id=? AND is_active=1','i',[(int)$u['id']]); db_statement('INSERT INTO payment_methods (user_id,provider,method_type,card_brand,card_last_four,card_expiry_month,card_expiry_year,provider_payment_method_id,display_label,is_default) VALUES (?,?,?,?,?,?,?,?,?,?)','issssiissi',[(int)$u['id'],$provider,$type,$brand,$lastFour,$month,$year,$providerId,$label,(int)$hasDefault]); respond(201,'Payment method created.',['id'=>db_insert_id()]);
@@ -301,17 +329,36 @@ function cart_note(): never { require_method(['POST','PATCH']);$u=require_user([
 function checkout(): never
 {
     require_method('POST');$u=require_user(['buyer']);$addressId=id_input('delivery_address_id');$paymentId=id_input('payment_method_id');$windowId=optional_id('delivery_window_id');
-    $order=db_transaction(function()use($u,$addressId,$paymentId,$windowId){$cart=active_cart($u);$address=db_one('SELECT * FROM buyer_addresses WHERE id=? AND user_id=?','ii',[$addressId,(int)$u['id']]);$payment=db_one('SELECT * FROM payment_methods WHERE id=? AND user_id=? AND is_active=1','ii',[$paymentId,(int)$u['id']]);if($address===null||$payment===null)fail(422,'Choose a valid delivery address and payment method.');$items=db_all('SELECT ci.*,p.name,p.farm_id,p.stock_quantity,p.is_active,p.selling_unit,(SELECT image_url FROM product_images WHERE product_id=p.id ORDER BY is_primary DESC,sort_order,id LIMIT 1) image_url FROM cart_items ci JOIN products p ON p.id=ci.product_id WHERE ci.cart_id=? FOR UPDATE','i',[(int)$cart['id']]);if($items===[])fail(422,'Your cart is empty.');$farmId=(int)$items[0]['farm_id'];foreach($items as $item){if(!(int)$item['is_active']||(int)$item['farm_id']!==$farmId||(float)$item['stock_quantity']<(float)$item['quantity'])fail(409,'One or more cart items are unavailable.');}$window=null;if($windowId!==null){$window=db_one('SELECT * FROM delivery_windows WHERE id=? AND is_active=1 AND (farm_id IS NULL OR farm_id=?) AND starts_at>NOW()','ii',[$windowId,$farmId]);if($window===null)fail(422,'Delivery window is unavailable.');if($window['capacity']!==null&&(int)db_one('SELECT COUNT(*) count FROM orders WHERE delivery_window_id=? AND status NOT IN (\'cancelled\',\'declined\')','i',[$windowId])['count']>=(int)$window['capacity'])fail(409,'Delivery window is full.');}$subtotal=0.0;foreach($items as $item)$subtotal+=(float)$item['quantity']*(float)$item['unit_price'];$number='RF-'.date('Ymd').'-'.strtoupper(bin2hex(random_bytes(3)));$snapshot=implode(', ',array_filter([$address['address_text'],$address['area'],$address['governorate']));db_statement('INSERT INTO orders (order_number,buyer_user_id,farm_id,delivery_address_id,payment_method_id,delivery_window_id,delivery_address_snapshot,buyer_name_snapshot,buyer_phone_snapshot,delivery_window_label,note,payment_status,payment_provider,subtotal_amount,delivery_fee,service_fee,total_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)','siiiiissssssssdddd',[$number,(int)$u['id'],$farmId,$addressId,$paymentId,$windowId,$snapshot,$address['recipient_name']?:$u['full_name'],$address['recipient_phone']?:$u['phone'],$window['label']??null,$cart['note'],$payment['method_type']==='cash_on_delivery'?'pending':'requires_payment',$payment['provider'],$subtotal,DELIVERY_FEE,SERVICE_FEE,$subtotal+DELIVERY_FEE+SERVICE_FEE]);$orderId=db_insert_id();foreach($items as $item){$line=(float)$item['quantity']*(float)$item['unit_price'];db_statement('INSERT INTO order_items (order_id,product_id,product_name_snapshot,product_image_url_snapshot,selling_unit_snapshot,quantity,unit_price,line_total) VALUES (?,?,?,?,?,?,?,?)','iisssddd',[$orderId,(int)$item['product_id'],$item['name'],$item['image_url'],$item['selling_unit'],(float)$item['quantity'],(float)$item['unit_price'],$line]);db_statement('UPDATE products SET stock_quantity=stock_quantity-? WHERE id=?','di',[(float)$item['quantity'],(int)$item['product_id']]);}db_statement('INSERT INTO order_status_history (order_id,status,note,changed_by_user_id) VALUES (?,\'new\',?,?)','isi',[$orderId,'Order placed',(int)$u['id']]);db_statement('UPDATE carts SET status=\'checked_out\' WHERE id=?','i',[(int)$cart['id']]);return ['id'=>$orderId,'order_number'=>$number,'farm_id'=>$farmId];});$farm=db_one('SELECT owner_user_id FROM farms WHERE id=?','i',[(int)$order['farm_id']]);if($farm!==null)notify_user((int)$farm['owner_user_id'],'new_order','New order '.$order['order_number'],'A new order needs your review.',['order_id'=>$order['id']]);respond(201,'Order placed.',$order);
+    $paymentMethod = db_one('SELECT method_type FROM payment_methods WHERE id=? AND user_id=? AND is_active=1', 'ii', [$paymentId, (int)$u['id']]);
+    if ($paymentMethod !== null && $paymentMethod['method_type'] !== 'cash_on_delivery') fail(422, 'Only cash on delivery is currently supported.');
+    $order=db_transaction(function()use($u,$addressId,$paymentId,$windowId){$cart=active_cart($u);$address=db_one('SELECT * FROM buyer_addresses WHERE id=? AND user_id=?','ii',[$addressId,(int)$u['id']]);$payment=db_one('SELECT * FROM payment_methods WHERE id=? AND user_id=? AND is_active=1','ii',[$paymentId,(int)$u['id']]);if($address===null||$payment===null)fail(422,'Choose a valid delivery address and payment method.');$items=db_all('SELECT ci.*,p.name,p.farm_id,p.stock_quantity,p.is_active,p.selling_unit,(SELECT image_url FROM product_images WHERE product_id=p.id ORDER BY is_primary DESC,sort_order,id LIMIT 1) image_url FROM cart_items ci JOIN products p ON p.id=ci.product_id WHERE ci.cart_id=? FOR UPDATE','i',[(int)$cart['id']]);if($items===[])fail(422,'Your cart is empty.');$farmId=(int)$items[0]['farm_id'];foreach($items as $item){if(!(int)$item['is_active']||(int)$item['farm_id']!==$farmId||(float)$item['stock_quantity']<(float)$item['quantity'])fail(409,'One or more cart items are unavailable.');}$window=null;if($windowId!==null){$window=db_one('SELECT * FROM delivery_windows WHERE id=? AND is_active=1 AND (farm_id IS NULL OR farm_id=?) AND starts_at>NOW()','ii',[$windowId,$farmId]);if($window===null)fail(422,'Delivery window is unavailable.');if($window['capacity']!==null&&(int)db_one('SELECT COUNT(*) count FROM orders WHERE delivery_window_id=? AND status NOT IN (\'cancelled\',\'declined\')','i',[$windowId])['count']>=(int)$window['capacity'])fail(409,'Delivery window is full.');}$subtotal=0.0;foreach($items as $item)$subtotal+=(float)$item['quantity']*(float)$item['unit_price'];$number='RF-'.date('Ymd').'-'.strtoupper(bin2hex(random_bytes(3)));$snapshot=implode(', ',array_filter([$address['address_text'],$address['area'],$address['governorate']]));db_statement('INSERT INTO orders (order_number,buyer_user_id,farm_id,delivery_address_id,payment_method_id,delivery_window_id,delivery_address_snapshot,buyer_name_snapshot,buyer_phone_snapshot,delivery_window_label,note,payment_status,payment_provider,subtotal_amount,delivery_fee,service_fee,total_amount) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)','siiiiisssssssdddd',[$number,(int)$u['id'],$farmId,$addressId,$paymentId,$windowId,$snapshot,$address['recipient_name']?:$u['full_name'],$address['recipient_phone']?:$u['phone'],$window['label']??null,$cart['note'],$payment['method_type']==='cash_on_delivery'?'pending':'requires_payment',$payment['provider'],$subtotal,DELIVERY_FEE,SERVICE_FEE,$subtotal+DELIVERY_FEE+SERVICE_FEE]);$orderId=db_insert_id();foreach($items as $item){$line=(float)$item['quantity']*(float)$item['unit_price'];db_statement('INSERT INTO order_items (order_id,product_id,product_name_snapshot,product_image_url_snapshot,selling_unit_snapshot,quantity,unit_price,line_total) VALUES (?,?,?,?,?,?,?,?)','iisssddd',[$orderId,(int)$item['product_id'],$item['name'],$item['image_url'],$item['selling_unit'],(float)$item['quantity'],(float)$item['unit_price'],$line]);db_statement('UPDATE products SET stock_quantity=stock_quantity-? WHERE id=?','di',[(float)$item['quantity'],(int)$item['product_id']]);}db_statement('INSERT INTO order_status_history (order_id,status,note,changed_by_user_id) VALUES (?,\'new\',?,?)','isi',[$orderId,'Order placed',(int)$u['id']]);db_statement('UPDATE carts SET status=\'checked_out\' WHERE id=?','i',[(int)$cart['id']]);return ['id'=>$orderId,'order_number'=>$number,'farm_id'=>$farmId];});$farm=db_one('SELECT owner_user_id FROM farms WHERE id=?','i',[(int)$order['farm_id']]);if($farm!==null)notify_user((int)$farm['owner_user_id'],'new_order','New order '.$order['order_number'],'A new order needs your review.',['order_id'=>$order['id']]);respond(201,'Order placed.',$order);
 }
 
 function orders_list(): never { require_method('GET');$u=require_user();$sql=$u['role']==='vendor'?'SELECT o.* FROM orders o JOIN farms f ON f.id=o.farm_id WHERE f.owner_user_id=?':'SELECT o.* FROM orders o WHERE o.buyer_user_id=?';respond(200,'Orders retrieved.',db_all($sql.' ORDER BY o.placed_at DESC','i',[(int)$u['id']])); }
 function order_detail(): never { require_method('GET');$u=require_user();$id=id_input();$order=db_one($u['role']==='vendor'?'SELECT o.* FROM orders o JOIN farms f ON f.id=o.farm_id WHERE o.id=? AND f.owner_user_id=?':'SELECT o.* FROM orders o WHERE o.id=? AND o.buyer_user_id=?','ii',[$id,(int)$u['id']]);if($order===null)fail(404,'Order not found.');$order['items']=db_all('SELECT * FROM order_items WHERE order_id=?','i',[$id]);$order['history']=db_all('SELECT status,note,created_at FROM order_status_history WHERE order_id=? ORDER BY created_at','i',[$id]);respond(200,'Order retrieved.',$order); }
 function order_status(): never
 {
-    require_method('POST');$u=require_user(['vendor']);$farm=owned_farm($u);$id=id_input('order_id');$order=db_one('SELECT * FROM orders WHERE id=? AND farm_id=?','ii',[$id,(int)$farm['id']]);if($order===null)fail(404,'Order not found.');$new=required_enum('status',['confirmed','preparing','ready','out_for_delivery','delivered','declined']);$allowed=['new'=>['confirmed','declined'],'confirmed'=>['preparing','declined'],'preparing'=>['ready'],'ready'=>['out_for_delivery'],'out_for_delivery'=>['delivered']];if(!in_array($new,$allowed[$order['status']]??[],true))fail(409,'This order status transition is not allowed.');$reason=$new==='declined'?clean_text('decline_reason',255):null;$timestamp=['confirmed'=>'confirmed_at','preparing'=>'prepared_at','ready'=>'ready_at','out_for_delivery'=>'out_for_delivery_at','delivered'=>'delivered_at','declined'=>'declined_at'][$new];db_transaction(function()use($id,$new,$reason,$timestamp,$u,$order){db_statement("UPDATE orders SET status=?, decline_reason=?, {$timestamp}=NOW() WHERE id=?",'ssi',[$new,$reason,$id]);db_statement('INSERT INTO order_status_history (order_id,status,note,changed_by_user_id) VALUES (?,?,?,?)','issi',[$id,$new,$reason,(int)$u['id']]);if($new==='declined')db_statement('UPDATE products p JOIN order_items oi ON oi.product_id=p.id SET p.stock_quantity=p.stock_quantity+oi.quantity WHERE oi.order_id=?','i',[$id]);});notify_user((int)$order['buyer_user_id'],'order_status','Order '.$order['order_number'].' updated','Your order is now '.str_replace('_',' ',$new),['order_id'=>$id]);respond(200,'Order status updated.');
+    require_method('POST');
+    $u = require_user(['vendor']);
+    $farm = owned_farm($u);
+    $id = id_input('order_id');
+    $new = required_enum('status', ['confirmed', 'preparing', 'ready', 'out_for_delivery', 'delivered', 'declined']);
+    $reason = $new === 'declined' ? clean_text('decline_reason', 255) : null;
+    $timestamp = ['confirmed'=>'confirmed_at', 'preparing'=>'prepared_at', 'ready'=>'ready_at', 'out_for_delivery'=>'out_for_delivery_at', 'delivered'=>'delivered_at', 'declined'=>'declined_at'][$new];
+    db_transaction(function () use ($id, $new, $reason, $timestamp, $u, $farm) {
+        $order = db_one('SELECT * FROM orders WHERE id=? AND farm_id=? FOR UPDATE', 'ii', [$id, (int)$farm['id']]);
+        if ($order === null) fail(404, 'Order not found.');
+        $allowed = ['new'=>['confirmed','declined'], 'confirmed'=>['preparing','declined'], 'preparing'=>['ready'], 'ready'=>['out_for_delivery'], 'out_for_delivery'=>['delivered']];
+        if (!in_array($new, $allowed[$order['status']] ?? [], true)) fail(409, 'This order status transition is not allowed.');
+        db_statement("UPDATE orders SET status=?, decline_reason=?, {$timestamp}=NOW() WHERE id=?", 'ssi', [$new, $reason, $id]);
+        db_statement('INSERT INTO order_status_history (order_id,status,note,changed_by_user_id) VALUES (?,?,?,?)', 'issi', [$id, $new, $reason, (int)$u['id']]);
+        if ($new === 'declined') db_statement('UPDATE products p JOIN order_items oi ON oi.product_id=p.id SET p.stock_quantity=p.stock_quantity+oi.quantity WHERE oi.order_id=?', 'i', [$id]);
+        notify_user((int)$order['buyer_user_id'], 'order_status', 'Order '.$order['order_number'].' updated', 'Your order is now '.str_replace('_',' ',$new), ['order_id'=>$id]);
+    });
+    respond(200, 'Order status updated.');
 }
 
-function vendor_products(): never { require_method('GET');$u=require_user(['vendor']);$farm=owned_farm($u);respond(200,'Products retrieved.',db_all('SELECT p.*,c.name category_name FROM products p LEFT JOIN categories c ON c.id=p.category_id WHERE p.farm_id=? ORDER BY p.updated_at DESC','i',[(int)$farm['id']])); }
+function vendor_products(): never { require_method('GET');$u=require_user(['vendor']);$farm=owned_farm($u);respond(200,'Products retrieved.',db_all('SELECT p.*,c.name category_name,(SELECT image_url FROM product_images WHERE product_id=p.id ORDER BY is_primary DESC,sort_order,id LIMIT 1) image_url FROM products p LEFT JOIN categories c ON c.id=p.category_id WHERE p.farm_id=? ORDER BY p.updated_at DESC','i',[(int)$farm['id']])); }
 function vendor_product_save(): never
 {
     require_method(['POST','PUT','PATCH']);$u=require_user(['vendor']);$farm=owned_farm($u);$id=optional_id('id');$name=clean_text('name',180);$categoryId=optional_id('category_id');if($categoryId!==null&&!db_exists('SELECT 1 FROM categories WHERE id=? AND is_active=1','i',[$categoryId]))fail(422,'category_id is invalid.');$price=required_decimal('price',0.01);$unit=required_enum('selling_unit',['per kg','per item','per bunch','per box','per litre']);$stock=required_decimal('stock_quantity',0.0);$stockUnit=required_enum('stock_unit',['kg','items','bunches','boxes','litres']);$description=clean_text('description',5000,false);$method=clean_text('farming_method',100,false);$quality=clean_text('quality_tag',100,false);$active=optional_bool('is_active',true);if($id===null){$slug=unique_slug('products',$name,(int)$farm['id']);db_statement('INSERT INTO products (farm_id,category_id,name,slug,description,price,selling_unit,stock_quantity,stock_unit,farming_method,quality_tag,is_active,published_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NOW())','iisssdsdsssi',[(int)$farm['id'],$categoryId,$name,$slug,$description,$price,$unit,$stock,$stockUnit,$method,$quality,(int)$active]);respond(201,'Product created.',['id'=>db_insert_id()]);}if(!db_exists('SELECT 1 FROM products WHERE id=? AND farm_id=?','ii',[$id,(int)$farm['id']]))fail(404,'Product not found.');db_statement('UPDATE products SET category_id=?,name=?,description=?,price=?,selling_unit=?,stock_quantity=?,stock_unit=?,farming_method=?,quality_tag=?,is_active=? WHERE id=?','issdsdsssii',[$categoryId,$name,$description,$price,$unit,$stock,$stockUnit,$method,$quality,(int)$active,$id]);respond(200,'Product updated.');
@@ -323,16 +370,16 @@ function farm_update(): never { require_method(['POST','PATCH','PUT']);$u=requir
 
 function farm_locations(): never { require_method('GET');$farm=owned_farm(require_user(['vendor']));respond(200,'Locations retrieved.',db_all('SELECT * FROM farm_locations WHERE farm_id=? AND is_active=1 ORDER BY is_default DESC,updated_at DESC','i',[(int)$farm['id']])); }
 function farm_location_save(): never { require_method('POST');$farm=owned_farm(require_user(['vendor']));$label=clean_text('label',120);$address=clean_text('address_text',2000);$default=!db_exists('SELECT 1 FROM farm_locations WHERE farm_id=? AND is_active=1','i',[(int)$farm['id']]);db_statement('INSERT INTO farm_locations (farm_id,label,address_text,is_default) VALUES (?,?,?,?)','issi',[(int)$farm['id'],$label,$address,(int)$default]);respond(201,'Location created.',['id'=>db_insert_id()]); }
-function farm_location_default(): never { require_method('POST');$farm=owned_farm(require_user(['vendor']));$id=id_input();if(!db_exists('SELECT 1 FROM farm_locations WHERE id=? AND farm_id=?','ii',[$id,(int)$farm['id']]))fail(404,'Location not found.');db_transaction(function()use($farm,$id){db_statement('UPDATE farm_locations SET is_default=0 WHERE farm_id=?','i',[(int)$farm['id']]);db_statement('UPDATE farm_locations SET is_default=1 WHERE id=?','i',[$id]);});respond(200,'Default location updated.'); }
-function farm_location_delete(): never { require_method('DELETE');$farm=owned_farm(require_user(['vendor']));db_statement('UPDATE farm_locations SET is_active=0,is_default=0 WHERE id=? AND farm_id=?','ii',[id_input(),(int)$farm['id']]);respond(200,'Location removed.'); }
+function farm_location_default(): never { require_method('POST');$farm=owned_farm(require_user(['vendor']));$id=id_input();db_transaction(function()use($farm,$id){if(db_one('SELECT id FROM farm_locations WHERE id=? AND farm_id=? AND is_active=1 FOR UPDATE','ii',[$id,(int)$farm['id']])===null)fail(404,'Location not found.');db_statement('UPDATE farm_locations SET is_default=0 WHERE farm_id=?','i',[(int)$farm['id']]);db_statement('UPDATE farm_locations SET is_default=1 WHERE id=?','i',[$id]);});respond(200,'Default location updated.'); }
+function farm_location_delete(): never { require_method('DELETE');$farm=owned_farm(require_user(['vendor']));$statement=db_statement('UPDATE farm_locations SET is_active=0,is_default=0 WHERE id=? AND farm_id=? AND is_active=1','ii',[id_input(),(int)$farm['id']]);if($statement->affected_rows===0)fail(404,'Location not found.');respond(200,'Location removed.'); }
 
 function team_list(): never { require_method('GET');$farm=owned_farm(require_user(['vendor']));respond(200,'Team retrieved.',db_all('SELECT id,user_id,full_name,email,phone,role,access_status,accepted_at,created_at FROM farm_team_members WHERE farm_id=? ORDER BY created_at','i',[(int)$farm['id']])); }
 function team_invite(): never { require_method('POST');$u=require_user(['vendor']);$farm=owned_farm($u);$name=clean_text('full_name',150);$role=required_enum('role',['order_manager','inventory_manager','support_agent']);$emailRaw=nullable_string('email',191);$phoneRaw=nullable_string('phone',30);if($emailRaw===null&&$phoneRaw===null)fail(422,'Provide an email address or phone number.');$email=$emailRaw===null?null:normalize_email($emailRaw);$phone=$phoneRaw===null?null:normalize_phone($phoneRaw);$token=bin2hex(random_bytes(32));db_statement('INSERT INTO farm_team_members (farm_id,invited_by_user_id,full_name,email,phone,role,invite_token_hash,invite_expires_at) VALUES (?,?,?,?,?,?,?,DATE_ADD(NOW(),INTERVAL 7 DAY))','iisssss',[(int)$farm['id'],(int)$u['id'],$name,$email,$phone,$role,hash('sha256',$token)]);respond(201,'Team invitation created.',env_value('APP_ENV')==='local'?['invite_token'=>$token]:null); }
-function team_remove(): never { require_method('DELETE');$farm=owned_farm(require_user(['vendor']));db_statement('DELETE FROM farm_team_members WHERE id=? AND farm_id=?','ii',[id_input(),(int)$farm['id']]);respond(200,'Team member removed.'); }
+function team_remove(): never { require_method('DELETE');$farm=owned_farm(require_user(['vendor']));$statement=db_statement('DELETE FROM farm_team_members WHERE id=? AND farm_id=?','ii',[id_input(),(int)$farm['id']]);if($statement->affected_rows===0)fail(404,'Team member not found.');respond(200,'Team member removed.'); }
 
 function documents_list(): never { require_method('GET');$farm=owned_farm(require_user(['vendor']));respond(200,'Documents retrieved.',db_all('SELECT id,document_type,document_name,file_url,file_mime_type,expires_at,status,review_note,created_at FROM farm_documents WHERE farm_id=? ORDER BY created_at DESC','i',[(int)$farm['id']])); }
 function document_create(): never { require_method('POST');$u=require_user(['vendor']);$farm=owned_farm($u);$type=clean_text('document_type',60);$name=clean_text('document_name',180);$url=required_url('file_url');$mime=clean_text('file_mime_type',100,false);if($mime!==null&&!in_array($mime,['application/pdf','image/jpeg','image/png'],true))fail(422,'Unsupported document file type.');db_statement('INSERT INTO farm_documents (farm_id,uploaded_by_user_id,document_type,document_name,file_url,file_mime_type) VALUES (?,?,?,?,?,?)','iissss',[(int)$farm['id'],(int)$u['id'],$type,$name,$url,$mime]);respond(201,'Document submitted for review.',['id'=>db_insert_id()]); }
-function document_delete(): never { require_method('DELETE');$farm=owned_farm(require_user(['vendor']));db_statement('DELETE FROM farm_documents WHERE id=? AND farm_id=? AND status=\'pending\'','ii',[id_input(),(int)$farm['id']]);respond(200,'Document removed.'); }
+function document_delete(): never { require_method('DELETE');$farm=owned_farm(require_user(['vendor']));$id=id_input();$url=db_transaction(function()use($farm,$id){$row=db_one('SELECT file_url FROM farm_documents WHERE id=? AND farm_id=? AND status=\'pending\' FOR UPDATE','ii',[$id,(int)$farm['id']]);if($row===null)fail(409,'Document not found or no longer pending.');db_statement('DELETE FROM farm_documents WHERE id=?','i',[$id]);return $row['file_url'];});if(preg_match('/^local-private:([a-f0-9]{64})$/',$url,$matches))delete_committed_upload($matches[1],'The document was removed from the list.');respond(200,'Document removed.'); }
 
 function notifications_get(): never { require_method('GET');$u=require_user();respond(200,'Notifications retrieved.',db_all('SELECT id,notification_type,title,body,data_json,is_read,read_at,created_at FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 100','i',[(int)$u['id']])); }
 function notifications_read(): never { require_method('POST');$u=require_user();$id=id_input();db_statement('UPDATE notifications SET is_read=1,read_at=NOW() WHERE id=? AND user_id=?','ii',[$id,(int)$u['id']]);respond(200,'Notification marked as read.'); }
@@ -342,40 +389,96 @@ function preference_save(): never { require_method('POST');$u=require_user();$ke
 function payout_account_save(): never { require_method('POST');$farm=owned_farm(require_user(['vendor']));$bank=clean_text('bank_name',150);$holder=clean_text('account_holder_name',150,false);$number=preg_replace('/\s+/', '', required_string('account_number',64))??'';if(!preg_match('/^[A-Za-z0-9]{8,34}$/',$number))fail(422,'account_number is invalid.');$lastFour=substr($number,-4);$encrypted=encrypt_sensitive($number);db_transaction(function()use($farm,$bank,$holder,$encrypted,$lastFour){db_statement('UPDATE payout_accounts SET is_default=0 WHERE farm_id=?','i',[(int)$farm['id']]);db_statement('INSERT INTO payout_accounts (farm_id,bank_name,account_holder_name,account_number_encrypted,account_last_four,is_default) VALUES (?,?,?,?,?,1)','issss',[(int)$farm['id'],$bank,$holder,$encrypted,$lastFour]);});respond(200,'Payout account updated.'); }
 function payouts_list(): never { require_method('GET');$farm=owned_farm(require_user(['vendor']));$account=db_one('SELECT id,bank_name,account_holder_name,account_last_four,status FROM payout_accounts WHERE farm_id=? AND is_default=1 LIMIT 1','i',[(int)$farm['id']]);$payouts=db_all('SELECT id,payout_number,currency,gross_amount,fees_amount,net_amount,status,scheduled_for,paid_at FROM payouts WHERE farm_id=? ORDER BY created_at DESC','i',[(int)$farm['id']]);respond(200,'Payouts retrieved.',['account'=>$account,'payouts'=>$payouts]); }
 
-function conversations_list(): never { require_method('GET');$u=require_user();$sql=$u['role']==='vendor'?'SELECT c.*,f.name farm_name FROM conversations c JOIN farms f ON f.id=c.farm_id WHERE f.owner_user_id=?':'SELECT c.*,f.name farm_name FROM conversations c LEFT JOIN farms f ON f.id=c.farm_id WHERE c.buyer_user_id=?';respond(200,'Conversations retrieved.',db_all($sql.' ORDER BY c.last_message_at DESC','i',[(int)$u['id']])); }
+function conversations_list(): never { require_method('GET');$u=require_user();$sql=$u['role']==='vendor'?'SELECT c.*,f.name AS farm_name,u.full_name AS participant_name FROM conversations c JOIN farms f ON f.id=c.farm_id LEFT JOIN users u ON u.id=c.buyer_user_id WHERE f.owner_user_id=?':'SELECT c.*,f.name AS farm_name,f.name AS participant_name FROM conversations c LEFT JOIN farms f ON f.id=c.farm_id WHERE c.buyer_user_id=?';respond(200,'Conversations retrieved.',db_all($sql.' ORDER BY c.last_message_at DESC,c.id DESC','i',[(int)$u['id']])); }
 function message_send(): never { require_method('POST');$u=require_user();$conversationId=optional_id('conversation_id');$farmId=optional_id('farm_id');$body=clean_text('body',4000);if($conversationId===null){if($u['role']!=='buyer'||$farmId===null||!db_exists('SELECT 1 FROM farms WHERE id=? AND is_active=1','i',[$farmId]))fail(422,'A valid farm_id is required.');db_statement('INSERT INTO conversations (buyer_user_id,farm_id,last_message_at) VALUES (?,?,NOW())','ii',[(int)$u['id'],$farmId]);$conversationId=db_insert_id();}$conversation=db_one('SELECT c.*,f.owner_user_id FROM conversations c LEFT JOIN farms f ON f.id=c.farm_id WHERE c.id=?','i',[$conversationId]);if($conversation===null||((int)$conversation['buyer_user_id']!==(int)$u['id']&&(int)$conversation['owner_user_id']!==(int)$u['id']))fail(403,'You cannot message in this conversation.');db_statement('INSERT INTO messages (conversation_id,sender_user_id,body) VALUES (?,?,?)','iis',[$conversationId,(int)$u['id'],$body]);db_statement('UPDATE conversations SET last_message_at=NOW() WHERE id=?','i',[$conversationId]);respond(201,'Message sent.',['conversation_id'=>$conversationId]); }
 function messages_list(): never { require_method('GET');$u=require_user();$id=id_input('conversation_id');$c=db_one('SELECT c.*,f.owner_user_id FROM conversations c LEFT JOIN farms f ON f.id=c.farm_id WHERE c.id=?','i',[$id]);if($c===null||((int)$c['buyer_user_id']!==(int)$u['id']&&(int)$c['owner_user_id']!==(int)$u['id']))fail(403,'You cannot view this conversation.');db_statement('UPDATE messages SET read_at=NOW() WHERE conversation_id=? AND sender_user_id!=? AND read_at IS NULL','ii',[$id,(int)$u['id']]);respond(200,'Messages retrieved.',db_all('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at','i',[$id])); }
 
 function farm_onboard(): never { require_method('POST');$u=require_user(['vendor']);if(db_exists('SELECT 1 FROM farms WHERE owner_user_id=?','i',[(int)$u['id']]))fail(409,'This vendor already has a farm.');$name=clean_text('name',180);$governorate=clean_text('governorate',100);$area=clean_text('area',120,false);$address=clean_text('address_text',2000,false);$types=clean_text('grower_types',2000);$slug=unique_slug('farms',$name);db_statement('INSERT INTO farms (owner_user_id,name,slug,governorate,area,address_text,grower_types,verification_status) VALUES (?,?,?,?,?,?,?,\'pending\')','issssss',[(int)$u['id'],$name,$slug,$governorate,$area,$address,$types]);respond(201,'Farm submitted for verification.',['id'=>db_insert_id(),'verification_status'=>'pending']); }
 
-function product_images_set(): never { require_method('POST');$u=require_user(['vendor']);$farm=owned_farm($u);$productId=id_input('product_id');if(!db_exists('SELECT 1 FROM products WHERE id=? AND farm_id=?','ii',[$productId,(int)$farm['id']]))fail(404,'Product not found.');$images=input('images');if(!is_array($images)||count($images)>8)fail(422,'images must contain between 1 and 8 image URLs.');$clean=[];foreach($images as $index=>$image){if(!is_array($image)||!isset($image['url']))fail(422,'Each image must include a URL.');$url=(string)$image['url'];$parts=parse_url($url);if($parts===false||!isset($parts['scheme'],$parts['host'])||!in_array(strtolower($parts['scheme']),['https','http'],true)||mb_strlen($url)>500)fail(422,'An image URL is invalid.');$alt=isset($image['alt_text'])?trim((string)$image['alt_text']):null;if($alt!==null&&mb_strlen($alt)>255)fail(422,'Image alt text is too long.');$clean[]=[$url,$alt,$index,(int)($index===0)];}db_transaction(function()use($productId,$clean){db_statement('DELETE FROM product_images WHERE product_id=?','i',[$productId]);foreach($clean as [$url,$alt,$index,$primary])db_statement('INSERT INTO product_images (product_id,image_url,alt_text,sort_order,is_primary) VALUES (?,?,?,?,?)','issii',[$productId,$url,$alt,$index,$primary]);});respond(200,'Product images updated.'); }
+function product_images_set(): never
+{
+    require_method('POST'); $farm=owned_farm(require_user(['vendor'])); $productId=id_input('product_id'); $images=input('images');
+    if(!is_array($images)||count($images)>8)fail(422,'images must contain between 1 and 8 image URLs.');
+    $clean=[];
+    foreach($images as $index=>$image){
+        if(!is_array($image)||!isset($image['url']))fail(422,'Each image must include a URL.');
+        $url=(string)$image['url']; $parts=parse_url($url);
+        if($parts===false||!isset($parts['scheme'],$parts['host'])||!in_array(strtolower($parts['scheme']),['https','http'],true)||mb_strlen($url)>500)fail(422,'An image URL is invalid.');
+        $alt=isset($image['alt_text'])?trim((string)$image['alt_text']):null;
+        if($alt!==null&&mb_strlen($alt)>255)fail(422,'Image alt text is too long.');
+        $clean[]=[$url,$alt,$index,(int)($index===0)];
+    }
+    $removed=db_transaction(function()use($farm,$productId,$clean){
+        if(db_one('SELECT id FROM products WHERE id=? AND farm_id=? FOR UPDATE','ii',[$productId,(int)$farm['id']])===null)fail(404,'Product not found.');
+        $old=array_column(db_all('SELECT image_url FROM product_images WHERE product_id=?','i',[$productId]),'image_url');
+        $retained=[];
+        db_statement('DELETE FROM product_images WHERE product_id=?','i',[$productId]);
+        foreach($clean as [$url,$alt,$index,$primary]){
+            $query=[]; parse_str((string)parse_url($url,PHP_URL_QUERY),$query);
+            if(($query['action']??null)==='media/product' && is_string($query['key']??null) && preg_match('/^[a-f0-9]{64}$/',$query['key'])){
+                $local='?action=media%2Fproduct&key='.$query['key'];
+                if(in_array($local,$old,true)){ $url=$local; $retained[]=$local; }
+            }
+            db_statement('INSERT INTO product_images (product_id,image_url,alt_text,sort_order,is_primary) VALUES (?,?,?,?,?)','issii',[$productId,$url,$alt,$index,$primary]);
+        }
+        return array_diff($old,$retained);
+    });
+    foreach($removed as $url)if(preg_match('/^\?action=media%2Fproduct&key=([a-f0-9]{64})$/',$url,$matches))delete_committed_upload($matches[1],'The product photos were updated.');
+    respond(200,'Product images updated.');
+}
 
 function appeal_create(): never { require_method('POST');$u=require_user(['buyer']);$orderId=id_input('order_id');$order=db_one('SELECT * FROM orders WHERE id=? AND buyer_user_id=? AND status=\'delivered\'','ii',[$orderId,(int)$u['id']]);if($order===null)fail(422,'Only delivered orders can be appealed.');if(db_exists('SELECT 1 FROM appeals WHERE order_id=? AND status NOT IN (\'resolved\',\'rejected\')','i',[$orderId]))fail(409,'This order already has an open appeal.');$reason=required_enum('reason_type',['quality_issue','missing_item','wrong_item','delivery_issue','other']);$description=clean_text('description',5000);$resolution=clean_text('requested_resolution',100,false);$number='AP-'.date('Ymd').'-'.strtoupper(bin2hex(random_bytes(3)));db_statement('INSERT INTO appeals (appeal_number,order_id,buyer_user_id,farm_id,reason_type,description,requested_resolution) VALUES (?,?,?,?,?,?,?)','siiisss',[$number,$orderId,(int)$u['id'],(int)$order['farm_id'],$reason,$description,$resolution]);$farm=db_one('SELECT owner_user_id FROM farms WHERE id=?','i',[(int)$order['farm_id']]);if($farm!==null)notify_user((int)$farm['owner_user_id'],'appeal','New appeal '.$number,'A buyer needs a response.',['order_id'=>$orderId]);respond(201,'Appeal created.',['id'=>db_insert_id(),'appeal_number'=>$number]); }
 function appeals_list(): never { require_method('GET');$u=require_user();$sql=$u['role']==='vendor'?'SELECT a.* FROM appeals a JOIN farms f ON f.id=a.farm_id WHERE f.owner_user_id=?':'SELECT * FROM appeals WHERE buyer_user_id=?';respond(200,'Appeals retrieved.',db_all($sql.' ORDER BY created_at DESC','i',[(int)$u['id']])); }
-function appeal_respond(): never { require_method('POST');$u=require_user(['vendor']);$farm=owned_farm($u);$id=id_input('appeal_id');$response=clean_text('vendor_response',5000);$appeal=db_one('SELECT * FROM appeals WHERE id=? AND farm_id=? AND status=\'response_needed\'','ii',[$id,(int)$farm['id']]);if($appeal===null)fail(409,'This appeal cannot be responded to.');db_statement('UPDATE appeals SET vendor_response=?,responded_by_user_id=?,responded_at=NOW(),status=\'vendor_responded\' WHERE id=?','sii',[$response,(int)$u['id'],$id]);notify_user((int)$appeal['buyer_user_id'],'appeal','Appeal '.$appeal['appeal_number'].' has a response','The farm has responded to your appeal.',['appeal_id'=>$id]);respond(200,'Appeal response submitted.'); }
+function appeal_respond(): never
+{
+    require_method('POST'); $u = require_user(['vendor']); $farm = owned_farm($u); $id = id_input('appeal_id'); $response = clean_text('vendor_response', 5000);
+    db_transaction(function () use ($u, $farm, $id, $response) {
+        $appeal = db_one('SELECT * FROM appeals WHERE id=? AND farm_id=? FOR UPDATE', 'ii', [$id, (int)$farm['id']]);
+        if ($appeal === null || $appeal['status'] !== 'response_needed') fail(409, 'This appeal cannot be responded to.');
+        db_statement('UPDATE appeals SET vendor_response=?,responded_by_user_id=?,responded_at=NOW(),status=\'vendor_responded\' WHERE id=?', 'sii', [$response, (int)$u['id'], $id]);
+        notify_user((int)$appeal['buyer_user_id'], 'appeal', 'Appeal '.$appeal['appeal_number'].' has a response', 'The farm has responded to your appeal.', ['appeal_id'=>$id]);
+    });
+    respond(200, 'Appeal response submitted.');
+}
 
-function order_cancel(): never { require_method('POST');$u=require_user(['buyer']);$id=id_input('order_id');$order=db_one('SELECT * FROM orders WHERE id=? AND buyer_user_id=?','ii',[$id,(int)$u['id']]);if($order===null)fail(404,'Order not found.');if(!in_array($order['status'],['new','confirmed'],true))fail(409,'This order can no longer be cancelled.');$reason=clean_text('reason',255,false);db_transaction(function()use($id,$reason,$u){db_statement('UPDATE orders SET status=\'cancelled\',cancelled_at=NOW(),decline_reason=? WHERE id=?','si',[$reason,$id]);db_statement('UPDATE products p JOIN order_items oi ON oi.product_id=p.id SET p.stock_quantity=p.stock_quantity+oi.quantity WHERE oi.order_id=?','i',[$id]);db_statement('INSERT INTO order_status_history (order_id,status,note,changed_by_user_id) VALUES (?,\'cancelled\',?,?)','isi',[$id,$reason,(int)$u['id']]);});respond(200,'Order cancelled.'); }
+function order_cancel(): never
+{
+    require_method('POST'); $u = require_user(['buyer']); $id = id_input('order_id'); $reason = clean_text('reason', 255, false);
+    db_transaction(function () use ($id, $reason, $u) {
+        $order = db_one('SELECT status FROM orders WHERE id=? AND buyer_user_id=? FOR UPDATE', 'ii', [$id, (int)$u['id']]);
+        if ($order === null) fail(404, 'Order not found.');
+        if (!in_array($order['status'], ['new', 'confirmed'], true)) fail(409, 'This order can no longer be cancelled.');
+        db_statement('UPDATE orders SET status=\'cancelled\',cancelled_at=NOW(),decline_reason=? WHERE id=?', 'si', [$reason, $id]);
+        db_statement('UPDATE products p JOIN order_items oi ON oi.product_id=p.id SET p.stock_quantity=p.stock_quantity+oi.quantity WHERE oi.order_id=?', 'i', [$id]);
+        db_statement('INSERT INTO order_status_history (order_id,status,note,changed_by_user_id) VALUES (?,\'cancelled\',?,?)', 'isi', [$id, $reason, (int)$u['id']]);
+    });
+    respond(200, 'Order cancelled.');
+}
+
+require_once __DIR__ . '/uploads.php';
 
 $routes = [
     'health' => 'health',
     'auth/register' => 'auth_register', 'auth/login' => 'auth_login', 'auth/verify-phone' => 'auth_verify_phone', 'auth/forgot-password' => 'auth_forgot_password', 'auth/reset-password' => 'auth_reset_password',
-    'profile/get' => 'profile_get', 'profile/update' => 'profile_update', 'catalog/categories' => 'catalog_categories', 'catalog/products' => 'catalog_products', 'catalog/product' => 'catalog_product',
+    'profile/get' => 'profile_get', 'profile/update' => 'profile_update', 'catalog/categories' => 'catalog_categories', 'catalog/farms' => 'catalog_farms', 'catalog/products' => 'catalog_products', 'catalog/product' => 'catalog_product',
     'saved/list' => 'saved_list', 'saved/toggle' => 'saved_toggle', 'addresses/list' => 'addresses_list', 'addresses/save' => 'address_save', 'addresses/default' => 'address_default', 'addresses/delete' => 'address_delete',
     'payments/list' => 'payments_list', 'payments/create' => 'payment_create', 'payments/default' => 'payment_default', 'payments/delete' => 'payment_delete',
     'cart/get' => 'cart_get', 'cart/add' => 'cart_add', 'cart/update' => 'cart_update', 'cart/remove' => 'cart_remove', 'cart/note' => 'cart_note', 'orders/checkout' => 'checkout', 'orders/list' => 'orders_list', 'orders/detail' => 'order_detail', 'orders/status' => 'order_status', 'orders/cancel' => 'order_cancel',
     'vendor/products' => 'vendor_products', 'vendor/product/save' => 'vendor_product_save', 'vendor/product/delete' => 'vendor_product_delete', 'vendor/product/images' => 'product_images_set', 'farm/onboard' => 'farm_onboard', 'farm/get' => 'farm_get', 'farm/update' => 'farm_update', 'farm/locations' => 'farm_locations', 'farm/location/save' => 'farm_location_save', 'farm/location/default' => 'farm_location_default', 'farm/location/delete' => 'farm_location_delete',
-    'team/list' => 'team_list', 'team/invite' => 'team_invite', 'team/remove' => 'team_remove', 'documents/list' => 'documents_list', 'documents/create' => 'document_create', 'documents/delete' => 'document_delete',
+    'vendor/product/upload' => 'product_image_upload', 'vendor/product/images/list' => 'product_images_list', 'vendor/product/images/delete' => 'product_image_delete', 'media/product' => 'product_image_media',
+    'team/list' => 'team_list', 'team/invite' => 'team_invite', 'team/remove' => 'team_remove', 'documents/list' => 'documents_list', 'documents/create' => 'document_create', 'documents/upload' => 'document_upload', 'documents/download' => 'document_download', 'documents/delete' => 'document_delete',
     'notifications/list' => 'notifications_get', 'notifications/read' => 'notifications_read', 'preferences/list' => 'preferences_list', 'preferences/save' => 'preference_save', 'payouts/list' => 'payouts_list', 'payouts/account/save' => 'payout_account_save', 'conversations/list' => 'conversations_list', 'messages/list' => 'messages_list', 'messages/send' => 'message_send', 'appeals/create' => 'appeal_create', 'appeals/list' => 'appeals_list', 'appeals/respond' => 'appeal_respond',
 ];
 
 try {
     $action = action_name();
+    api_log('info', 'Request', ['action' => $action, 'body_keys' => array_keys(request_data())]);
     if (!isset($routes[$action])) fail(404, 'Unknown API action.');
     $routes[$action]();
 } catch (mysqli_sql_exception $exception) {
-    error_log('Database error in proc.php: ' . $exception->getMessage());
-    fail(500, 'A database error occurred.');
+    api_log_exception('Database error', $exception);
+    fail(500, 'A database error occurred.', api_debug_enabled() ? ['debug' => $exception->getMessage()] : []);
 } catch (Throwable $exception) {
-    error_log('API error in proc.php: ' . $exception->getMessage());
-    fail(500, 'An unexpected server error occurred.');
+    api_log_exception('Unhandled exception', $exception);
+    fail(500, 'An unexpected server error occurred.', api_debug_enabled() ? ['debug' => $exception->getMessage()] : []);
 }

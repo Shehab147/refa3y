@@ -1,2 +1,46 @@
-import { router } from 'expo-router'; import { Text, View } from 'react-native'; import { DetailShell } from '@/components/detail-ui'; import { Icon, PrimaryButton, StatusPill, palette } from '@/components/market-ui';
-export default function OrderDetail(){return <DetailShell title="Order #RF-2918"><View className="rounded-3xl bg-forest p-5"><StatusPill>Out for delivery</StatusPill><Text className="mt-4 font-sans text-2xl font-bold text-white">Arriving today</Text><Text className="mt-1 font-sans text-sm text-[#CBDDD2]">Estimated between 4:00 and 6:00 PM</Text></View><Text className="mb-4 mt-7 font-sans text-xl font-bold text-ink">Order progress</Text>{[['checkmark.circle.fill','Order confirmed','10:14 AM'],['checkmark.circle.fill','Packed at the farm','1:05 PM'],['truck.box.fill','Out for delivery','3:20 PM'],['circle','Delivered','Expected by 6 PM']].map((item,index)=><View key={item[1]} className="flex-row pb-5"><Icon name={item[0] as never} color={index<3?palette.leaf:'#BFC6C2'}/><View className="ml-3 flex-1"><Text className="font-sans text-sm font-bold text-ink">{item[1]}</Text><Text className="mt-1 font-sans text-xs text-muted">{item[2]}</Text></View></View>)}<View className="rounded-3xl border border-line bg-white p-5"><Text className="font-sans text-base font-bold text-ink">5 items from Nile Valley Farms</Text><Text className="mt-2 font-sans text-sm leading-6 text-muted">Tomatoes, cucumbers, potatoes, parsley and mint</Text><View className="mt-4 flex-row"><Text className="flex-1 font-sans text-sm text-muted">Order total</Text><Text className="font-sans text-base font-bold text-ink">EGP 342</Text></View></View><View className="mt-5"><PrimaryButton light onPress={()=>router.push({pathname:'/(buyer)/chat',params:{farm:'Nile Valley Farms'}})}>Message the farm</PrimaryButton></View><Text className="mt-5 text-center font-sans text-xs text-muted">Cancellation is unavailable because this order has already left the farm.</Text></DetailShell>}
+import { useLocalSearchParams } from 'expo-router';
+import { useEffect, useState } from 'react';
+import { Text, View } from 'react-native';
+import { DetailShell } from '@/components/detail-ui';
+import { StatusPill } from '@/components/market-ui';
+import { api, ApiError } from '@/lib/api';
+import { type OrderDetail, orderStatusLabel } from '@/lib/orders';
+
+export default function BuyerOrderDetail() {
+  const { id } = useLocalSearchParams<{ id?: string }>();
+  const [result, setResult] = useState<{ id: string; order?: OrderDetail; error?: string } | null>(null);
+  const validId = !!id && /^[1-9]\d*$/.test(id);
+  const order = result && result.id === id ? result.order : undefined;
+  const error = !validId ? 'Select an order from your orders list.' : result && result.id === id ? result.error : undefined;
+
+  useEffect(() => {
+    let active = true;
+    if (!id || !/^[1-9]\d*$/.test(id)) {
+      return () => { active = false; };
+    }
+    void api<OrderDetail>('orders/detail', { query: { id } }).then((result) => {
+      if (active) setResult({ id, order: result });
+    }).catch((caught: unknown) => {
+      if (active) setResult({ id, error: caught instanceof ApiError ? caught.message : 'Unable to load this order.' });
+    });
+    return () => { active = false; };
+  }, [id]);
+
+  return <DetailShell title={order ? `Order ${order.order_number}` : 'Order details'}>
+    {error ? <Text className="font-sans text-sm text-[#A3483A]">{error}</Text> : !order ? <Text className="font-sans text-sm text-muted">Loading order…</Text> : <>
+      <View className="rounded-3xl border border-line bg-white p-5">
+        <StatusPill>{orderStatusLabel(order.status)}</StatusPill>
+        <Text className="mt-4 font-sans text-sm font-bold text-ink">Delivery address</Text>
+        <Text className="mt-2 font-sans text-sm text-muted">{order.delivery_address_snapshot}</Text>
+        {order.delivery_window_label ? <Text className="mt-2 font-sans text-sm text-muted">{order.delivery_window_label}</Text> : null}
+      </View>
+      <Text className="mb-3 mt-7 font-sans text-xl font-bold text-ink">Items</Text>
+      <View className="rounded-3xl border border-line bg-white p-5">
+        {order.items.map((item) => <View key={item.id} className="flex-row py-2"><Text className="flex-1 font-sans text-sm text-ink">{item.product_name_snapshot} × {item.quantity} ({item.selling_unit_snapshot})</Text><Text className="font-sans text-sm text-ink">{order.currency} {item.line_total}</Text></View>)}
+        <Text className="mt-4 font-sans text-base font-bold text-forest">Total: {order.currency} {order.total_amount}</Text>
+      </View>
+      <Text className="mb-3 mt-7 font-sans text-xl font-bold text-ink">Order progress</Text>
+      {order.history.map((entry, index) => <View key={`${entry.created_at}-${index}`} className="mb-4"><Text className="font-sans text-sm font-bold text-ink">{orderStatusLabel(entry.status)}</Text><Text className="mt-1 font-sans text-xs text-muted">{entry.created_at}{entry.note ? ` · ${entry.note}` : ''}</Text></View>)}
+    </>}
+  </DetailShell>;
+}
